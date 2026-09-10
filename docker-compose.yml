@@ -1,0 +1,73 @@
+# Benchmark stack: Cosmian KMS on PostgreSQL, plus the PKCS#11 client.
+#
+#   docker compose up --build
+#
+# Results land in ./results (samples CSV and the SVG charts).
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: kms
+      POSTGRES_PASSWORD: kms
+      POSTGRES_DB: kms
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kms -d kms"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  kms:
+    # Must be the non-FIPS image: the 'ed25519' curve is compiled out of
+    # kms-fips, where the default would silently fall back to NIST P-256.
+    image: ghcr.io/cosmian/kms:${KMS_VERSION:-5.27.1}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Pass configuration as flags only. If a TOML config is ever loaded, the
+    # server ignores every other argument, and supplying both is an error.
+    command:
+      - --database-type=postgresql
+      - --database-url=postgresql://kms:kms@postgres:5432/kms
+      - --hostname=0.0.0.0
+      - --port=9998
+    ports:
+      - "9998:9998"
+    healthcheck:
+      # /health performs a real database round trip, unlike /version.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9998/health || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 10s
+
+  bench:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.bench
+      args:
+        KMS_VERSION: ${KMS_VERSION:-5.27.1}
+    depends_on:
+      kms:
+        condition: service_healthy
+    environment:
+      KMS_URL: http://kms:9998
+      CURVE: p256
+      KEY_ID: bench-p256-key
+      WORK_DIR: /work
+      RUST_BACKTRACE: "1"
+    volumes:
+      - ./results:/work
+    # Override to switch modes, e.g.
+    #   docker compose run --rm bench single
+    command:
+      - benchmark
+      - --iterations=200
+      - --warmup=20
+      - --output=/work/samples.csv
+      - --chart=/work/benchmark.svg
+
+volumes:
+  pgdata:

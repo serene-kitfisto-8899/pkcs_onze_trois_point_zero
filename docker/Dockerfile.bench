@@ -1,0 +1,36 @@
+# The Cosmian PKCS#11 provider ships only inside the KMS image, so we lift the
+# shared object out of it rather than downloading a release asset.
+ARG KMS_VERSION=5.27.1
+FROM ghcr.io/cosmian/kms:${KMS_VERSION} AS cosmian
+
+# Build against bookworm to match the runtime below: the provider is linked
+# against a glibc at least as new as the one in the KMS image.
+FROM rust:1.90-slim-bookworm AS build
+WORKDIR /src
+
+# Cache the dependency build separately from the source.
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src \
+    && echo 'fn main() {}' > src/main.rs \
+    && echo '' > src/lib.rs \
+    && cargo build --release --offline 2>/dev/null || cargo build --release \
+    && rm -rf src
+
+COPY src ./src
+# Touch so cargo does not reuse the dummy artefacts above.
+RUN touch src/main.rs src/lib.rs && cargo build --release
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl jq openssl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=cosmian /usr/lib/libcosmian_pkcs11.so /usr/lib/libcosmian_pkcs11.so
+COPY --from=cosmian /usr/local/bin/ckms /usr/local/bin/ckms
+COPY --from=build /src/target/release/sign-tx /usr/local/bin/sign-tx
+COPY docker/provision.sh /usr/local/bin/provision.sh
+RUN chmod +x /usr/local/bin/provision.sh
+
+ENV COSMIAN_PKCS11_MODULE=/usr/lib/libcosmian_pkcs11.so
+WORKDIR /work
+ENTRYPOINT ["/usr/local/bin/provision.sh"]
