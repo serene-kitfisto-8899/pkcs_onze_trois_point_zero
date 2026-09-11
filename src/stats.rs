@@ -8,6 +8,8 @@
 use serde::Serialize;
 use std::time::Instant;
 
+use crate::pkcs11::Curve;
+
 /// The phases timed per iteration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -24,6 +26,14 @@ impl Phase {
             Phase::Sign => "C_Sign (network)",
             Phase::Verify => "verify (local)",
             Phase::Total => "total",
+        }
+    }
+
+    pub fn label_for_curve(&self, curve: Curve) -> &'static str {
+        match (self, curve) {
+            (Phase::SignInit, Curve::Ed25519) => "C_MessageSignInit (setup)",
+            (Phase::Sign, Curve::Ed25519) => "C_SignMessage (network)",
+            _ => self.label(),
         }
     }
 

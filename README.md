@@ -5,12 +5,8 @@ through the Cosmian PKCS#11 module. Supports Ed25519 and NIST P-256 keys
 (`--curve`, default `ed25519`). Two modes: a single signature, and a latency
 benchmark that measures each signing step separately.
 
-> **Note on Ed25519 against a real KMS:** Cosmian/kms's own PKCS#11 provider
-> currently fails to expose Ed25519 keys created via `ckms`/KMIP — see
-> [Cosmian/kms#1183](https://github.com/Cosmian/kms/issues/1183). Until that
-> is fixed upstream, use `--curve p256` for an end-to-end run against a real
-> KMS; `--curve ed25519` still works against PKCS#11 modules that don't have
-> this bug (e.g. SoftHSM2, see Testing below).
+The current Cosmian KMS provider exposes Ed25519 keys created through
+`ckms`/KMIP and implements the PKCS#11 v3 one-shot message-signing flow.
 
 ## Building
 
@@ -39,6 +35,7 @@ sign-tx --module … single --json
 
 # Benchmark, with an SVG chart of the results
 sign-tx --module … benchmark -n 1000 --warmup 50 \
+    --warmup-time 3 \
     --output samples.csv --chart bench.svg
 
 # NIST P-256 instead of the default Ed25519 (also settable via
@@ -46,22 +43,30 @@ sign-tx --module … benchmark -n 1000 --warmup 50 \
 sign-tx --module … --curve p256 benchmark -n 1000
 ```
 
-`--slot` is auto-selected when exactly one token is present. `--key-label`
+`--slot` is auto-selected when exactly one token is present. `--key-id`
 reuses an existing key instead of creating one.
+
+To build the local KMS, provision an Ed25519 key, run three independent
+trials, and regenerate all files under `results/`, use:
+
+```sh
+./bench.sh --client-cpus 10 --kms-cpus 8,12,14
+```
+
+Choose non-overlapping physical cores appropriate for the host. Omitting the
+CPU options leaves both processes unrestricted.
 
 ## Design
 
-**Raw PKCS#11.** The signing path drives the `CK_FUNCTION_LIST` directly rather
-than using the high-level `cryptoki` wrapper. `cryptoki`'s `Session::sign()`
-issues `C_SignInit` and then *two* `C_Sign` calls — one to query the signature
-length, one to retrieve it — which against a network-backed KMS risks two round
-trips per signature, and which collapses the `C_SignInit`/`C_Sign` split we want
-to measure. Ed25519 signatures are a fixed 64 bytes, so for that curve the
-buffer is presized and the length query skipped entirely: one round trip.
-`CKM_ECDSA` (P-256) returns a DER-encoded signature of variable length (up to
-72 bytes), so that path presizes to the maximum and still needs only one round
-trip — `C_Sign` reports the actual length written, so no second query is ever
-issued.
+**Raw PKCS#11 v3.** The module is discovered through `C_GetInterface` and the
+returned v3.1 `CK_FUNCTION_LIST_3_0`, rather than the legacy
+`C_GetFunctionList` table or a high-level wrapper. Ed25519 uses the v3 message
+flow: `C_MessageSignInit` runs once during signer setup, then every measured
+iteration calls one `C_SignMessage` into a reused, pre-sized 64-byte buffer.
+There is no per-message init or length-query call. P-256 falls back to the
+classic `C_SignInit`/`C_Sign` functions because the provider's v3 message API
+currently implements the EdDSA flow only; its DER signature buffer is still
+pre-sized to avoid the length-query round trip.
 
 **Signing input.** `CKM_EDDSA` (Ed25519, pure mode) signs the message
 directly. `CKM_ECDSA` (P-256) per the PKCS#11 spec signs a pre-hashed digest,
@@ -101,19 +106,28 @@ transactions — irrelevant here since nothing is ever broadcast.
   floor is explicit. An RDTSC-based clock would add precision far below the
   signal.
 
-- **Phases.** `C_SignInit`, `C_Sign` (the network-bound component), and local
-  verification are timed separately, plus the total. Serialization is measured
-  once during setup rather than per iteration.
+- **Phases.** Ed25519 reports `C_SignMessage` (the network-bound component) and
+  local verification separately, plus the total. `C_MessageSignInit` runs once
+  during setup and is not part of a per-message sample. P-256 reports
+  `C_SignInit` and `C_Sign`. Serialization is measured once during setup rather
+  than per iteration.
 
 - **Payloads.** All messages are pre-generated before the timed loop, so
   serialization never lands inside a measurement. Each varies its recent
   blockhash, making every payload unique — defeating any caching in the module
   or the KMS — while keeping the byte length constant.
 
-- **Warmup.** Fixed iteration count, running the identical code path, absorbing
-  TLS handshake, connection setup, KMS-side cache population and CPU frequency
-  ramp. Discarded from the statistics but reported, so the cold-start cost is
-  visible rather than hidden.
+- **Warmup.** Runs until both a minimum iteration count and minimum elapsed time
+  are satisfied, using the identical measured code path. This absorbs TLS
+  handshake, connection setup, KMS-side cache population, and CPU frequency
+  ramp. Warmup samples are discarded from the statistics but summarized so the
+  cold-start cost remains visible.
+
+- **Repeatability.** `bench.sh` runs three independent trials and selects the
+  median trial by total p50 while retaining every trial's CSV. Optional CPU
+  affinity keeps the single-threaded client and multithreaded KMS on separate
+  physical cores, avoiding scheduler migration that otherwise dominated local
+  measurements on the development host.
 
 - **Sequential.** One session, one thread. This measures *latency*. Concurrent
   signing would report percentiles containing queueing delay at the KMS, which
@@ -149,8 +163,7 @@ cargo test
 
 The payload builder, the `CKA_EC_POINT`/SPKI normalisation (for both curves)
 and the statistics are unit-tested without a KMS. For an end-to-end check
-against a real PKCS#11 module, SoftHSM2 works (Ed25519 is unaffected by the
-Cosmian KMS bug noted above since SoftHSM2 is a different provider):
+against another real PKCS#11 module, SoftHSM2 can also be used:
 
 ```sh
 export SOFTHSM2_CONF=/path/to/softhsm2.conf
