@@ -64,7 +64,7 @@ impl Transfer {
     /// variable-length, so it does not fit that slot; callers benchmarking
     /// P-256 get a byte stream of the same shape (count-prefixed signature
     /// + message) but not a valid, broadcastable Solana transaction. This
-    /// tool never broadcasts, so only the payload shape/size matters here.
+    ///   tool never broadcasts, so only the payload shape/size matters here.
     pub fn to_wire(&self, signature: &[u8]) -> Vec<u8> {
         let message = self.message_bytes();
         let mut out = Vec::with_capacity(1 + signature.len() + message.len());

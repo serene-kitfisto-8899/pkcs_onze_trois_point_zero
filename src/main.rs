@@ -81,6 +81,11 @@ enum Command {
         #[arg(long, default_value_t = 50)]
         warmup: usize,
 
+        /// Minimum warmup duration in seconds. Warmup continues until both this
+        /// duration and --warmup iterations have completed.
+        #[arg(long, default_value_t = 3)]
+        warmup_time: u64,
+
         /// Recipient address, base58.
         #[arg(long, default_value = "11111111111111111111111111111112")]
         to: String,
@@ -122,6 +127,7 @@ fn main() -> Result<()> {
         Command::Benchmark {
             iterations,
             warmup,
+            warmup_time,
             to,
             lamports,
             output,
@@ -133,6 +139,7 @@ fn main() -> Result<()> {
             Action::Benchmark(BenchOptions {
                 iterations: *iterations,
                 warmup: *warmup,
+                warmup_time: std::time::Duration::from_secs(*warmup_time),
                 lamports: *lamports,
                 to: decode_pubkey(to).context("invalid --to address")?,
                 output: output.clone(),

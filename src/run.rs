@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Solana account addresses are 32 bytes (Ed25519 public keys). A P-256
 /// public key does not fit that shape, so when benchmarking with `--curve
@@ -33,6 +33,7 @@ pub struct SingleOptions {
 pub struct BenchOptions {
     pub iterations: usize,
     pub warmup: usize,
+    pub warmup_time: Duration,
     pub lamports: u64,
     pub to: [u8; 32],
     pub output: Option<std::path::PathBuf>,
@@ -65,10 +66,12 @@ fn sign_once(signer: &Signer<'_>, message: &[u8], signature: &mut [u8]) -> Resul
 
     let start = Instant::now();
 
-    session.sign_init(handle, curve)?;
+    if curve != Curve::Ed25519 {
+        session.sign_init(handle, curve)?;
+    }
     let after_init = Instant::now();
 
-    let len = session.sign_into(&input, signature)?;
+    let len = session.sign_into(curve, &input, signature)?;
     let after_sign = Instant::now();
 
     if curve == Curve::Ed25519 && len != SIGNATURE_LEN {
@@ -139,17 +142,22 @@ pub fn run_single(
         println!("Blockhash       {}", encode_pubkey(&options.blockhash));
         println!("Message         {} bytes", message.len());
         println!("Signature       {}", bs58::encode(signature).into_string());
-        println!("Verified        yes (locally, {})", verifier_name(signer.curve()));
+        println!(
+            "Verified        yes (locally, {})",
+            verifier_name(signer.curve())
+        );
         println!("Broadcast       no");
         println!();
+        if signer.curve() != Curve::Ed25519 {
+            println!(
+                "  {:<18} {}",
+                "C_SignInit",
+                format_nanos(timing.sign_init as f64)
+            );
+        }
         println!(
             "  {:<18} {}",
-            "C_SignInit",
-            format_nanos(timing.sign_init as f64)
-        );
-        println!(
-            "  {:<18} {}",
-            "C_Sign (network)",
+            Phase::Sign.label_for_curve(signer.curve()),
             format_nanos(timing.sign as f64)
         );
         println!(
@@ -189,7 +197,10 @@ pub fn run_benchmark(
     // Pre-generate every message so serialization never lands in the timed
     // loop. Varying only the blockhash keeps each payload unique — defeating
     // any caching in the module or KMS — at a constant byte length.
-    let total_messages = options.warmup + options.iterations;
+    let warmup_message_count = options
+        .warmup
+        .max(usize::from(!options.warmup_time.is_zero()));
+    let total_messages = warmup_message_count + options.iterations;
     let serialize_start = Instant::now();
     let messages: Vec<Vec<u8>> = (0..total_messages)
         .map(|i| {
@@ -233,22 +244,33 @@ pub fn run_benchmark(
     // population and CPU frequency ramp. Discarded from the statistics but
     // reported, so the cold-start cost is visible rather than hidden.
     let mut warmup_samples = Samples::with_capacity(options.warmup);
-    if options.warmup > 0 {
-        print!("Warming up ({} iterations)... ", options.warmup);
+    if warmup_message_count > 0 {
+        print!(
+            "Warming up (minimum {} iterations / {:.1}s)... ",
+            options.warmup,
+            options.warmup_time.as_secs_f64()
+        );
         std::io::stdout().flush().ok();
-        for message in messages.iter().take(options.warmup) {
+        let warmup_start = Instant::now();
+        let mut warmup_index = 0_usize;
+        while warmup_index < options.warmup || warmup_start.elapsed() < options.warmup_time {
             if interrupted.load(Ordering::Relaxed) {
                 bail!("interrupted during warmup");
             }
+            let message = messages
+                .get(warmup_index % warmup_message_count)
+                .context("warmup message index is invalid")?;
             let timing =
                 sign_once(&signer, message, &mut signature).context("warmup iteration failed")?;
             warmup_samples.push(timing.total);
+            warmup_index += 1;
         }
         println!("done");
     }
 
     let mut phases: Vec<(Phase, Samples)> = Phase::ALL
         .iter()
+        .filter(|phase| signer.curve() != Curve::Ed25519 || **phase != Phase::SignInit)
         .map(|phase| (*phase, Samples::with_capacity(options.iterations)))
         .collect();
 
@@ -257,7 +279,7 @@ pub fn run_benchmark(
 
     let run_start = Instant::now();
     let mut completed = 0usize;
-    for message in messages.iter().skip(options.warmup) {
+    for message in messages.iter().skip(warmup_message_count) {
         if interrupted.load(Ordering::Relaxed) {
             println!();
             eprintln!("interrupted after {completed} iterations");
@@ -292,7 +314,7 @@ pub fn run_benchmark(
     }
 
     println!();
-    report(&phases, &warmup_samples, completed, wall);
+    report(&phases, &warmup_samples, completed, wall, signer.curve());
 
     if let Some(path) = &options.output {
         write_samples(path, &phases)?;
@@ -307,7 +329,7 @@ pub fn run_benchmark(
                 .map(|i| i.library_description)
                 .unwrap_or_else(|_| "PKCS#11 module".into())
         );
-        let svg = crate::chart::render(&phases, &title);
+        let svg = crate::chart::render(&phases, &title, signer.curve());
         std::fs::write(path, svg).with_context(|| format!("failed to write {}", path.display()))?;
         println!("Chart written to {}", path.display());
     }
@@ -340,11 +362,19 @@ fn print_header(
         info.cryptoki_version.1
     );
     println!("Manufacturer      {}", info.manufacturer);
+    println!(
+        "Interface         PKCS#11 v3 (C_GetInterface, {}.{})",
+        info.cryptoki_version.0, info.cryptoki_version.1
+    );
     println!("Key id            {}", signer.label());
     println!("Mechanism         {}", signer.curve().mechanism_name());
     println!("Payload           Solana transfer message, {payload_len} bytes");
     println!("Iterations        {}", options.iterations);
     println!("Warmup            {}", options.warmup);
+    println!(
+        "Warmup time       {:.1} s minimum",
+        options.warmup_time.as_secs_f64()
+    );
     println!("Concurrency       1 (sequential — latency, not throughput under load)");
     println!(
         "Clock             std::time::Instant, overhead ~{}",
@@ -364,6 +394,7 @@ fn report(
     warmup: &Samples,
     completed: usize,
     wall: std::time::Duration,
+    curve: Curve,
 ) {
     if let Some(summary) = warmup.summary() {
         println!(
@@ -385,7 +416,7 @@ fn report(
         let Some(s) = samples.summary() else { continue };
         println!(
             "{:<18} {:>8} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
-            phase.label(),
+            phase.label_for_curve(curve),
             s.n,
             format_nanos(s.min as f64),
             format_nanos(s.p50 as f64),
@@ -421,7 +452,14 @@ fn report(
         )
         .map(|(sign, total)| sign.total as f64 / total.total as f64 * 100.0);
     if let Some(share) = sign_share {
-        println!("C_Sign share      {share:.1}% of total (the network-bound component)");
+        println!(
+            "{} share      {share:.1}% of total (the network-bound component)",
+            if curve == Curve::Ed25519 {
+                "C_SignMessage"
+            } else {
+                "C_Sign"
+            }
+        );
     }
     println!(
         "Wall clock        {} for {completed} iterations",

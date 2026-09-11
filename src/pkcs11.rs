@@ -11,6 +11,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use cryptoki_sys::*;
 use libloading::Library;
 use sha2::Digest as _;
+use std::borrow::Cow;
 use std::ffi::c_void;
 use std::ptr;
 
@@ -89,10 +90,14 @@ impl Curve {
     /// itself for Ed25519 (`CKM_EDDSA` signs the message directly), or its
     /// SHA-256 digest for P-256 (`CKM_ECDSA` per the PKCS#11 spec signs a
     /// pre-hashed digest, not the raw message).
-    pub fn signing_input(self, message: &[u8]) -> Vec<u8> {
+    ///
+    /// Returns `Cow::Borrowed` for Ed25519 — no transformation is needed, so
+    /// there is nothing to allocate — and `Cow::Owned` only for P-256, where
+    /// a genuinely new value (the digest) must be produced.
+    pub fn signing_input<'a>(self, message: &'a [u8]) -> Cow<'a, [u8]> {
         match self {
-            Curve::Ed25519 => message.to_vec(),
-            Curve::P256 => sha2::Sha256::digest(message).to_vec(),
+            Curve::Ed25519 => Cow::Borrowed(message),
+            Curve::P256 => Cow::Owned(sha2::Sha256::digest(message).to_vec()),
         }
     }
 
@@ -105,7 +110,7 @@ impl Curve {
 }
 
 pub struct Module {
-    functions: CK_FUNCTION_LIST,
+    functions: CK_FUNCTION_LIST_3_0,
     // Held to keep the shared object mapped; the function pointers above
     // point into it.
     _library: Library,
@@ -177,18 +182,36 @@ impl Module {
             .with_context(|| format!("failed to dlopen PKCS#11 module at {path}"))?;
 
         let functions = unsafe {
-            let get_list = library
-                .get::<unsafe extern "C" fn(*mut CK_FUNCTION_LIST_PTR) -> CK_RV>(
-                    b"C_GetFunctionList\0",
-                )
-                .context("module does not export C_GetFunctionList")?;
+            let get_interface = library
+                .get::<unsafe extern "C" fn(
+                    CK_UTF8CHAR_PTR,
+                    CK_VERSION_PTR,
+                    CK_INTERFACE_PTR_PTR,
+                    CK_FLAGS,
+                ) -> CK_RV>(b"C_GetInterface\0")
+                .context("module does not export PKCS#11 v3 C_GetInterface")?;
 
-            let mut list_ptr: CK_FUNCTION_LIST_PTR = ptr::null_mut();
-            check(get_list(&mut list_ptr), "C_GetFunctionList")?;
-            if list_ptr.is_null() {
-                bail!("C_GetFunctionList returned a null function list");
+            let mut version = CK_VERSION { major: 3, minor: 1 };
+            let mut interface: CK_INTERFACE_PTR = ptr::null_mut();
+            check(
+                get_interface(ptr::null_mut(), &mut version, &mut interface, 0),
+                "C_GetInterface",
+            )?;
+            if interface.is_null() {
+                bail!("C_GetInterface returned a null interface");
             }
-            *list_ptr
+            let functions = (*interface).pFunctionList.cast::<CK_FUNCTION_LIST_3_0>();
+            if functions.is_null() {
+                bail!("C_GetInterface returned a null v3 function list");
+            }
+            if (*functions).version.major != 3 || (*functions).version.minor != 1 {
+                bail!(
+                    "module returned PKCS#11 {}.{} instead of the requested v3.1 interface",
+                    (*functions).version.major,
+                    (*functions).version.minor
+                );
+            }
+            *functions
         };
 
         let mut module = Self {
@@ -448,7 +471,10 @@ impl Session<'_> {
 
         let mut class_val = class;
         let id_bytes = id.as_bytes().to_vec();
-        let mut template = vec![attr(CKA_CLASS, &mut class_val), attr_bytes(CKA_ID, &id_bytes)];
+        let mut template = vec![
+            attr(CKA_CLASS, &mut class_val),
+            attr_bytes(CKA_ID, &id_bytes),
+        ];
 
         unsafe {
             check(
@@ -515,17 +541,27 @@ impl Session<'_> {
     /// Neither Ed25519 (RFC 8032 pure mode) nor raw `CKM_ECDSA` need a
     /// mechanism parameter.
     pub fn sign_init(&self, key: CK_OBJECT_HANDLE, curve: Curve) -> Result<()> {
-        let f = self
-            .module
-            .functions
-            .C_SignInit
-            .ok_or_else(|| anyhow!("module does not implement C_SignInit"))?;
         let mut mechanism = CK_MECHANISM {
             mechanism: curve.sign_mechanism(),
             pParameter: ptr::null_mut(),
             ulParameterLen: 0,
         };
-        unsafe { check(f(self.handle, &mut mechanism, key), "C_SignInit") }
+        match curve {
+            Curve::Ed25519 => {
+                let f = self.module.functions.C_MessageSignInit.ok_or_else(|| {
+                    anyhow!("PKCS#11 v3 module does not implement C_MessageSignInit")
+                })?;
+                unsafe { check(f(self.handle, &mut mechanism, key), "C_MessageSignInit") }
+            }
+            Curve::P256 => {
+                let f = self
+                    .module
+                    .functions
+                    .C_SignInit
+                    .ok_or_else(|| anyhow!("module does not implement C_SignInit"))?;
+                unsafe { check(f(self.handle, &mut mechanism, key), "C_SignInit") }
+            }
+        }
     }
 
     /// A single `C_Sign` into a caller-owned, presized buffer.
@@ -536,24 +572,60 @@ impl Session<'_> {
     /// byte or two run to run, so the caller presizes to
     /// `Curve::max_signature_len` and this reports the actual length
     /// written, avoiding the length-query round trip either way.
-    pub fn sign_into(&self, data: &[u8], signature: &mut [u8]) -> Result<usize> {
-        let f = self
-            .module
-            .functions
-            .C_Sign
-            .ok_or_else(|| anyhow!("module does not implement C_Sign"))?;
+    pub fn sign_into(&self, curve: Curve, data: &[u8], signature: &mut [u8]) -> Result<usize> {
         let mut len = signature.len() as CK_ULONG;
-        let rv = unsafe {
-            f(
-                self.handle,
-                data.as_ptr() as *mut u8,
-                data.len() as CK_ULONG,
-                signature.as_mut_ptr(),
-                &mut len,
-            )
+        let rv = match curve {
+            Curve::Ed25519 => {
+                let f =
+                    self.module.functions.C_SignMessage.ok_or_else(|| {
+                        anyhow!("PKCS#11 v3 module does not implement C_SignMessage")
+                    })?;
+                unsafe {
+                    f(
+                        self.handle,
+                        ptr::null_mut(),
+                        0,
+                        data.as_ptr().cast_mut(),
+                        data.len() as CK_ULONG,
+                        signature.as_mut_ptr(),
+                        &mut len,
+                    )
+                }
+            }
+            Curve::P256 => {
+                let f = self
+                    .module
+                    .functions
+                    .C_Sign
+                    .ok_or_else(|| anyhow!("module does not implement C_Sign"))?;
+                unsafe {
+                    f(
+                        self.handle,
+                        data.as_ptr().cast_mut(),
+                        data.len() as CK_ULONG,
+                        signature.as_mut_ptr(),
+                        &mut len,
+                    )
+                }
+            }
         };
-        check(rv, "C_Sign")?;
+        check(
+            rv,
+            if curve == Curve::Ed25519 {
+                "C_SignMessage"
+            } else {
+                "C_Sign"
+            },
+        )?;
         Ok(len as usize)
+    }
+
+    pub fn message_sign_final(&self) -> Result<()> {
+        let finalize =
+            self.module.functions.C_MessageSignFinal.ok_or_else(|| {
+                anyhow!("PKCS#11 v3 module does not implement C_MessageSignFinal")
+            })?;
+        unsafe { check(finalize(self.handle), "C_MessageSignFinal") }
     }
 
     pub fn destroy(&self, object: CK_OBJECT_HANDLE) -> Result<()> {

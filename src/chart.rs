@@ -4,7 +4,10 @@
 //! fixed chart types over data we already hold, and SVG in a self-contained
 //! file is more useful for a report than a PNG needing a rendering backend.
 
-use crate::stats::{Phase, Samples, Summary, format_nanos};
+use crate::{
+    pkcs11::Curve,
+    stats::{Phase, Samples, Summary, format_nanos},
+};
 use std::fmt::Write as _;
 
 const WIDTH: f64 = 960.0;
@@ -35,7 +38,7 @@ fn escape(text: &str) -> String {
 
 /// Render the full report: one histogram and one timeline per phase, plus a
 /// stacked bar showing where the time goes.
-pub fn render(phases: &[(Phase, Samples)], title: &str) -> String {
+pub fn render(phases: &[(Phase, Samples)], title: &str, curve: Curve) -> String {
     let panels: Vec<(Phase, &Samples, Summary)> = phases
         .iter()
         .filter_map(|(phase, samples)| samples.summary().map(|summary| (*phase, samples, summary)))
@@ -72,13 +75,19 @@ pub fn render(phases: &[(Phase, Samples)], title: &str) -> String {
             .collect();
         let sum: f64 = components.iter().map(|(_, v)| v).sum();
         if sum > 0.0 {
-            svg.push_str(&composition_bar(&components, sum, total.2.total as f64, y));
+            svg.push_str(&composition_bar(
+                &components,
+                sum,
+                total.2.total as f64,
+                y,
+                curve,
+            ));
         }
         y += composition_height;
     }
 
     for (phase, samples, summary) in &panels {
-        svg.push_str(&panel(*phase, samples, summary, y));
+        svg.push_str(&panel(*phase, samples, summary, y, curve));
         y += panel_height;
     }
 
@@ -87,7 +96,13 @@ pub fn render(phases: &[(Phase, Samples)], title: &str) -> String {
 }
 
 /// Stacked bar: the share of total time each phase accounts for.
-fn composition_bar(components: &[(Phase, f64)], sum: f64, total: f64, y: f64) -> String {
+fn composition_bar(
+    components: &[(Phase, f64)],
+    sum: f64,
+    total: f64,
+    y: f64,
+    curve: Curve,
+) -> String {
     let mut out = String::new();
     let _ = write!(
         out,
@@ -133,7 +148,7 @@ fn composition_bar(components: &[(Phase, f64)], sum: f64, total: f64, y: f64) ->
             phase_colour(*phase),
             legend_x + 15.0,
             legend_y,
-            escape(phase.label()),
+            escape(phase.label_for_curve(curve)),
             escape(&format_nanos(*value))
         );
     }
@@ -153,7 +168,7 @@ fn composition_bar(components: &[(Phase, f64)], sum: f64, total: f64, y: f64) ->
 }
 
 /// One phase: a latency distribution and a per-iteration timeline.
-fn panel(phase: Phase, samples: &Samples, summary: &Summary, y: f64) -> String {
+fn panel(phase: Phase, samples: &Samples, summary: &Summary, y: f64, curve: Curve) -> String {
     let mut out = String::new();
     let colour = phase_colour(phase);
 
@@ -161,7 +176,7 @@ fn panel(phase: Phase, samples: &Samples, summary: &Summary, y: f64) -> String {
         out,
         r##"<text x="{MARGIN_LEFT}" y="{:.1}" font-size="14" font-weight="600" fill="#1a1d23">{}</text>"##,
         y + 26.0,
-        escape(phase.label())
+        escape(phase.label_for_curve(curve))
     );
     let _ = write!(
         out,
@@ -391,7 +406,7 @@ mod tests {
 
     #[test]
     fn renders_well_formed_svg() {
-        let svg = render(&phases(), "test run");
+        let svg = render(&phases(), "test run", Curve::Ed25519);
         assert!(svg.starts_with("<svg"));
         assert!(svg.trim_end().ends_with("</svg>"));
         assert_eq!(svg.matches("<svg").count(), 1);
@@ -399,22 +414,26 @@ mod tests {
 
     #[test]
     fn includes_every_phase_label() {
-        let svg = render(&phases(), "test run");
+        let svg = render(&phases(), "test run", Curve::Ed25519);
         for phase in Phase::ALL {
-            assert!(svg.contains(phase.label()), "missing {}", phase.label());
+            assert!(
+                svg.contains(phase.label_for_curve(Curve::Ed25519)),
+                "missing {}",
+                phase.label_for_curve(Curve::Ed25519)
+            );
         }
     }
 
     #[test]
     fn empty_input_renders_nothing() {
-        assert!(render(&[], "empty").is_empty());
+        assert!(render(&[], "empty", Curve::Ed25519).is_empty());
         let empty = vec![(Phase::Sign, Samples::with_capacity(0))];
-        assert!(render(&empty, "empty").is_empty());
+        assert!(render(&empty, "empty", Curve::Ed25519).is_empty());
     }
 
     #[test]
     fn escapes_title_markup() {
-        let svg = render(&phases(), "a <b> & c");
+        let svg = render(&phases(), "a <b> & c", Curve::Ed25519);
         assert!(svg.contains("a &lt;b&gt; &amp; c"));
         assert!(!svg.contains("<b>"));
     }
@@ -422,7 +441,7 @@ mod tests {
     #[test]
     fn handles_identical_samples_without_dividing_by_zero() {
         let flat = vec![(Phase::Sign, samples_of(&[500; 40]))];
-        let svg = render(&flat, "flat");
+        let svg = render(&flat, "flat", Curve::Ed25519);
         assert!(svg.contains("</svg>"));
         assert!(!svg.contains("NaN"));
         assert!(!svg.contains("inf"));
@@ -431,7 +450,7 @@ mod tests {
     #[test]
     fn handles_single_sample() {
         let one = vec![(Phase::Sign, samples_of(&[42]))];
-        let svg = render(&one, "one");
+        let svg = render(&one, "one", Curve::Ed25519);
         assert!(svg.contains("</svg>"));
         assert!(!svg.contains("NaN"));
     }
@@ -440,14 +459,14 @@ mod tests {
     fn large_runs_switch_to_envelope_rendering() {
         let values: Vec<u64> = (0..4000).map(|i| 1000 + (i % 97)).collect();
         let big = vec![(Phase::Sign, samples_of(&values))];
-        let svg = render(&big, "big");
+        let svg = render(&big, "big", Curve::Ed25519);
         assert!(svg.contains("<polygon"));
         assert!(!svg.contains("NaN"));
     }
 
     #[test]
     fn small_runs_plot_individual_points() {
-        let svg = render(&phases(), "small");
+        let svg = render(&phases(), "small", Curve::Ed25519);
         assert!(svg.contains("<circle"));
     }
 }

@@ -6,7 +6,9 @@ use crate::pkcs11::{
 };
 use anyhow::{Context, Result, bail};
 use cryptoki_sys::{CK_SLOT_ID, CKA_EC_POINT};
-use ed25519_dalek::{Signature as Ed25519Signature, Verifier as _, VerifyingKey as Ed25519VerifyingKey};
+use ed25519_dalek::{
+    Signature as Ed25519Signature, Verifier as _, VerifyingKey as Ed25519VerifyingKey,
+};
 use p256::ecdsa::signature::hazmat::PrehashVerifier;
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
 
@@ -155,14 +157,13 @@ impl<'a> Signer<'a> {
         let mut signature = vec![0u8; self.curve.max_signature_len()];
         let input = self.curve.signing_input(probe);
         self.session.sign_init(self.keys.private, self.curve)?;
-        let len = self.session.sign_into(&input, &mut signature)?;
+        let len = self.session.sign_into(self.curve, &input, &mut signature)?;
         signature.truncate(len);
         if self.curve == Curve::Ed25519 && len != SIGNATURE_LEN {
             bail!("expected a {SIGNATURE_LEN}-byte signature, module returned {len} bytes");
         }
-        self.verify(probe, &signature).context(
-            "setup self-test failed: the signature did not verify against the public key",
-        )
+        self.verify(probe, &signature)
+            .context("setup self-test failed: the signature did not verify against the public key")
     }
 
     /// The public key, as a DER SubjectPublicKeyInfo-independent raw
@@ -220,6 +221,11 @@ impl<'a> Signer<'a> {
 
     /// Destroy the key pair if this run created it.
     pub fn cleanup(&self) {
+        if self.curve == Curve::Ed25519
+            && let Err(error) = self.session.message_sign_final()
+        {
+            eprintln!("warning: failed to finalize message signing: {error:#}");
+        }
         if !self.owns_key {
             return;
         }
@@ -273,4 +279,3 @@ fn describe_slots(slots: &[crate::pkcs11::Slot]) -> String {
         .collect::<Vec<_>>()
         .join(", ")
 }
-
